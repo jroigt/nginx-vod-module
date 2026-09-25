@@ -78,6 +78,12 @@ enum {
 struct ngx_http_vod_ctx_s;
 typedef struct ngx_http_vod_ctx_s ngx_http_vod_ctx_t;
 
+// number of times a single remote read is re-issued when the source drops the connection
+// mid-body. A progressive (non-fragmented) download is one long, un-retryable response, so a
+// single dropped block would otherwise truncate the whole file; retrying the block absorbs the
+// transient drop. Segmented (hls/dash) delivery does not need this - the player retries segments.
+#define VOD_REMOTE_READ_MAX_RETRIES (3)
+
 typedef ngx_int_t (*ngx_http_vod_state_machine_t)(ngx_http_vod_ctx_t* ctx);
 typedef ngx_int_t (*ngx_http_vod_open_file_t)(
 	ngx_http_request_t* r, ngx_str_t* path, uint32_t flags, void** context
@@ -176,6 +182,13 @@ struct ngx_http_vod_ctx_s {
 	ngx_str_t* metadata_parts;
 	size_t metadata_part_count;
 
+	// remote read retry (re-issue a read when the source drops the connection mid-body)
+	ngx_http_vod_http_reader_state_t* remote_read_state;
+	ngx_buf_t* remote_read_buf;
+	size_t remote_read_size;
+	off_t remote_read_offset;
+	ngx_uint_t remote_read_retries_left;
+
 	// read frames state
 	media_base_metadata_t* base_metadata;
 	media_format_read_request_t frames_read_req;
@@ -233,6 +246,9 @@ static ngx_int_t ngx_http_vod_dump_http_part(void* context, off_t start, off_t e
 static ngx_int_t ngx_http_vod_dump_http_request(void* context);
 static void ngx_http_vod_http_reader_get_path(void* context, ngx_str_t* path);
 static ngx_int_t ngx_http_vod_async_http_read(
+	ngx_http_vod_http_reader_state_t* state, ngx_buf_t* buf, size_t size, off_t offset
+);
+static ngx_int_t ngx_http_vod_async_http_read_impl(
 	ngx_http_vod_http_reader_state_t* state, ngx_buf_t* buf, size_t size, off_t offset
 );
 
@@ -4000,6 +4016,46 @@ ngx_http_vod_handle_read_completed(void* context, ngx_int_t rc, ngx_buf_t* buf, 
 			goto finalize_request;
 		}
 
+		// a remote source that drops the connection mid-body surfaces here as a gateway error.
+		// re-issue the same read a few times before giving up, so one flaky fetch does not truncate
+		// the whole progressive response (which is a single, un-retryable download once started).
+		if (ctx->remote_read_state != NULL
+		    && ctx->remote_read_retries_left > 0
+		    && (rc == NGX_HTTP_BAD_GATEWAY
+		        || rc == NGX_HTTP_SERVICE_UNAVAILABLE
+		        || rc == NGX_HTTP_GATEWAY_TIME_OUT)) {
+			ctx->remote_read_retries_left--;
+
+			ngx_log_error(
+				NGX_LOG_ERR,
+				ctx->submodule_context.request_context.log,
+				0,
+				"ngx_http_vod_handle_read_completed: remote read failed %i at offset %O size %z, "
+				"retrying (%ui left)",
+				rc,
+				ctx->remote_read_offset,
+				ctx->remote_read_size,
+				ctx->remote_read_retries_left
+			);
+
+			// re-read from the start of the buffer (a partial read may have advanced it)
+			if (ctx->remote_read_buf != NULL) {
+				ctx->remote_read_buf->pos = ctx->remote_read_buf->last = ctx->remote_read_buf->start;
+			}
+
+			rc = ngx_http_vod_async_http_read_impl(
+				ctx->remote_read_state,
+				ctx->remote_read_buf,
+				ctx->remote_read_size,
+				ctx->remote_read_offset
+			);
+			if (rc == NGX_AGAIN) {
+				return;
+			}
+
+			goto finalize_request;
+		}
+
 		ngx_log_debug1(
 			NGX_LOG_DEBUG_HTTP,
 			ctx->submodule_context.request_context.log,
@@ -4455,13 +4511,19 @@ ngx_http_vod_dump_file(void* context) {
 ////// Remote & mapped modes
 
 static ngx_int_t
-ngx_http_vod_async_http_read(
+ngx_http_vod_async_http_read_impl(
 	ngx_http_vod_http_reader_state_t* state, ngx_buf_t* buf, size_t size, off_t offset
 ) {
 	ngx_http_vod_ctx_t* ctx;
 	ngx_child_request_params_t child_params;
 
 	ctx = ngx_http_get_module_ctx(state->r, ngx_http_vod_module);
+
+	// remember this read so a mid-body source drop can be re-issued (see handle_read_completed)
+	ctx->remote_read_state = state;
+	ctx->remote_read_buf = buf;
+	ctx->remote_read_size = size;
+	ctx->remote_read_offset = offset;
 
 	ngx_memzero(&child_params, sizeof(child_params));
 	child_params.method = NGX_HTTP_GET;
@@ -4473,6 +4535,17 @@ ngx_http_vod_async_http_read(
 	return ngx_child_request_start(
 		state->r, ngx_http_vod_handle_read_completed, ctx, &state->upstream_location, &child_params, buf
 	);
+}
+
+static ngx_int_t
+ngx_http_vod_async_http_read(
+	ngx_http_vod_http_reader_state_t* state, ngx_buf_t* buf, size_t size, off_t offset
+) {
+	ngx_http_vod_ctx_t* ctx = ngx_http_get_module_ctx(state->r, ngx_http_vod_module);
+
+	// fresh read: reset the per-read retry budget, then issue it
+	ctx->remote_read_retries_left = VOD_REMOTE_READ_MAX_RETRIES;
+	return ngx_http_vod_async_http_read_impl(state, buf, size, offset);
 }
 
 static ngx_int_t
